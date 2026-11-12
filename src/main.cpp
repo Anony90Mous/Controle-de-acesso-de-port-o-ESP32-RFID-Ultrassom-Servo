@@ -4,6 +4,8 @@
 #include <MFRC522DriverPinSimple.h>
 #include <MFRC522Debug.h>
 #include <ESP32Servo.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
 
 // ==============================================================================
 // 1. CONFIGURAÇÕES DO LEITOR RFID (MFRC522)
@@ -43,7 +45,7 @@ const unsigned long velocidadePassoMs = 20; // Intervalo entre passos (ms)
 // ==============================================================================
 const int pinTrig = 4;                 // Disparo ultrassônico
 const int pinEcho = 15;                // Retorno do eco acústico
-const float distanciaMaximaCm = 30.0;  // Distância de corte para presença (cm)
+const float distanciaMaximaCm = 20.0;  // Distância de corte para presença (cm)
 
 unsigned long ultimaLeituraUltrassom = 0;
 const unsigned long intervaloLeituraUsMs = 100; // Intervalo de amostragem acústica
@@ -66,7 +68,26 @@ unsigned long tempoUltimoFechamento = 0;
 const unsigned long cooldownLeituraMs = 3000; // 3 segundos de intervalo após fechar
 
 // ==============================================================================
-// 5. FUNÇÕES AUXILIARES
+// 5. CONFIGURAÇÕES DE REDE WI-FI E BROKER MQTT (MOSQUITTO)
+// ==============================================================================
+const char* ssid = "IOT";
+const char* password = "teste1234";
+
+// Variável com o IP do computador/servidor onde o Mosquitto está rodando
+const char* mqttServer = "192.168.0.176"; // <--- Altere esta variável para o novo IP quando necessário
+const int mqttPort = 1883;                 // Porta padrão MQTT
+const char* mqttUser = "";                  // Usuário (em branco caso não use senha)
+const char* mqttPassword = "";              // Senha (em branco caso não use senha)
+const char* topicoSub = "portao-tag";      // Tópico inscrito
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+unsigned long ultimoTentativaConexaoMQTT = 0;
+const unsigned long intervaloReconexaoMQTT = 5000; // Intervalo não-bloqueante de reconexão (5s)
+
+// ==============================================================================
+// 6. FUNÇÕES AUXILIARES
 // ==============================================================================
 
 /**
@@ -152,12 +173,87 @@ void abrirTranca() {
   Serial.println(F("[!] ACESSO PERMITIDO: Abrindo portao..."));
 }
 
+/**
+ * Callback executado automaticamente quando chega mensagem em tópicos inscritos.
+ */
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String mensagem = "";
+  for (unsigned int i = 0; i < length; i++) {
+    mensagem += (char)payload[i];
+  }
+  mensagem.trim();
+
+  Serial.println(F("----------------------------------------"));
+  Serial.print(F("[MQTT] Mensagem recebida no topico ["));
+  Serial.print(topic);
+  Serial.print(F("]: "));
+  Serial.println(mensagem);
+
+  // Se o tópico for o inscrito ('portao-tag')
+  if (String(topic) == topicoSub) {
+    if (mensagem.equalsIgnoreCase("ABRIR") || mensagem.equalsIgnoreCase("OPEN")) {
+      Serial.println(F("[MQTT] Comando valido de abertura recebido! Abrindo portao..."));
+      abrirTranca();
+    } else {
+      Serial.print(F("[MQTT] Mensagem informativa ou Tag no topico: "));
+      Serial.println(mensagem);
+    }
+  }
+  Serial.println(F("----------------------------------------\n"));
+}
+
+/**
+ * Garante reconexão com Wi-Fi e Broker MQTT de forma não-bloqueante (sem travar o loop).
+ */
+void verificarConexoes() {
+  // Se Wi-Fi desconectou, apenas aguarda reconexão automática da stack ESP32
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  // Se o broker MQTT desconectou, tenta reconectar a cada 5 segundos
+  if (!mqttClient.connected()) {
+    unsigned long agora = millis();
+    if (agora - ultimoTentativaConexaoMQTT >= intervaloReconexaoMQTT) {
+      ultimoTentativaConexaoMQTT = agora;
+      Serial.print(F("[MQTT] Conectando ao Mosquitto em "));
+      Serial.print(mqttServer);
+      Serial.print(F(":"));
+      Serial.print(mqttPort);
+      Serial.print(F("... "));
+
+      String clientId = "ESP32_Portao_";
+      clientId += String(random(0xffff), HEX);
+
+      bool conectado = false;
+      if (strlen(mqttUser) > 0) {
+        conectado = mqttClient.connect(clientId.c_str(), mqttUser, mqttPassword);
+      } else {
+        conectado = mqttClient.connect(clientId.c_str());
+      }
+
+      if (conectado) {
+        Serial.println(F("Conectado com sucesso!"));
+        mqttClient.subscribe(topicoSub);
+        Serial.print(F("[MQTT] Inscrito com sucesso no topico: "));
+        Serial.println(topicoSub);
+      } else {
+        Serial.print(F("Falha na conexao, rc="));
+        Serial.print(mqttClient.state());
+        Serial.println(F(" (tentara novamente em 5s)"));
+      }
+    }
+  }
+}
+
 // ==============================================================================
-// 6. SETUP
+// 7. SETUP
 // ==============================================================================
 void setup() {
   Serial.begin(115200);
   while (!Serial);
+
+  randomSeed(micros());
 
   pinMode(pinTrig, OUTPUT);
   pinMode(pinEcho, INPUT);
@@ -178,12 +274,31 @@ void setup() {
   Serial.println(F("========================================================"));
   MFRC522Debug::PCD_DumpVersionToSerial(mfrc522, Serial);
   Serial.println(F("Sistema pronto. Aguardando presenca...\n"));
+
+  Serial.println(F("========================================================"));
+  Serial.println(F("WIFI & MQTT: Conexão"));
+  Serial.println(F("========================================================"));
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print(F("Conectando ao Wi-Fi '"));
+  Serial.print(ssid);
+  Serial.println(F("'..."));
+
+  // Configuração do broker MQTT Mosquitto
+  mqttClient.setServer(mqttServer, mqttPort);
+  mqttClient.setCallback(mqttCallback);
 }
 
 // ==============================================================================
-// 7. LOOP PRINCIPAL
+// 8. LOOP PRINCIPAL
 // ==============================================================================
 void loop() {
+  // PASSO 0: Verificação de conexões e processamento de mensagens MQTT
+  verificarConexoes();
+  if (mqttClient.connected()) {
+    mqttClient.loop();
+  }
+
   // PASSO 1: Movimentação suave contínua
   gerenciarMovimentoServo();
 
@@ -252,12 +367,19 @@ void loop() {
   Serial.print(F("[+] Tag Lida: "));
   Serial.println(uidString);
 
-  // PASSO 6: VALIDAÇÃO DO ACESSO
-  if (uidString == UIDAutorizado) {
-    abrirTranca();
+  // PASSO 6: PUBLICAÇÃO DA TAG NO BROKER MQTT (Validação remota)
+  if (mqttClient.connected()) {
+    bool pubOk = mqttClient.publish(topicoSub, uidString.c_str());
+    if (pubOk) {
+      Serial.println(F("[MQTT] Tag enviada com sucesso no topico 'portao-tag'!"));
+    } else {
+      Serial.println(F("[MQTT] Falha ao publicar tag no broker!"));
+    }
   } else {
-    Serial.println(F("[X] ACESSO NEGADO: Tag nao cadastrada!"));
+    Serial.println(F("[MQTT] Nao conectado ao broker. Tag nao pode ser enviada."));
   }
+
+  Serial.println(F("[i] Aguardando comando remoto via MQTT para abertura..."));
   Serial.println(F("----------------------------------------\n"));
 
   // Adormece o chip da tag para evitar leituras repetidas em cascata
